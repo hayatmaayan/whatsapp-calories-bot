@@ -1,12 +1,12 @@
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 from openai import OpenAI
-import os, json, sqlite3, re
+import os, json, sqlite3
 from datetime import datetime
 
 app = Flask(__name__)
-client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 DB = "calories.db"
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 def init_db():
     conn = sqlite3.connect(DB)
@@ -63,12 +63,38 @@ def reset_today(sender):
     conn.commit()
     conn.close()
 
-def extract_json(text):
-    text = text.strip()
-    text = re.sub(r"^```json\s*", "", text)
-    text = re.sub(r"^```\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
-    return json.loads(text)
+def openai_parse(msg):
+    prompt = f"""
+אתה בוט קלוריות בעברית.
+
+המשתמש כתב:
+{msg}
+
+החזר JSON בלבד בפורמט:
+{{
+  "items": [
+    {{"item": "שם מוצר וכמות", "calories": 100}}
+  ]
+}}
+
+חוקים:
+1. אם המשתמש כתב קלוריות מדויקות, השתמש בהן בדיוק.
+2. אם לא נכתבו קלוריות מדויקות, הערך קלוריות והוסף 3%-5% מרווח ביטחון.
+3. אם יש כמה מוצרים, פצל למוצרים נפרדים.
+4. אם ההודעה לא קשורה לאוכל, החזר items ריק.
+5. calories חייב להיות מספר שלם בלבד.
+6. אל תחזיר טקסט מחוץ ל-JSON.
+"""
+
+    ai = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0
+    )
+
+    raw = ai.choices[0].message.content.strip()
+    raw = raw.replace("```json", "").replace("```", "").strip()
+    return json.loads(raw).get("items", [])
 
 @app.route("/")
 def home():
@@ -81,19 +107,17 @@ def whatsapp():
 
     msg = request.form.get("Body", "").strip()
     sender = request.form.get("From", "")
+    command = msg.upper()
 
     try:
-        command = msg.upper()
-
         if command == "RESET":
             reset_today(sender)
             reply = "✅ היום אופס בהצלחה\nסה״כ היום: 0 קלוריות"
 
-        elif command == "TOTAL":
-            total = daily_total(sender)
-            reply = f"סה״כ יומי עד כה: {total} קלוריות"
+        elif command in ["TOTAL", "סהכ", "סה״כ"]:
+            reply = f"סה״כ יומי עד כה: {daily_total(sender)} קלוריות"
 
-        elif command == "SUMMARY":
+        elif command in ["SUMMARY", "סיכום"]:
             rows = daily_summary(sender)
 
             if not rows:
@@ -107,39 +131,10 @@ def whatsapp():
                 reply = "\n".join(lines)
 
         else:
-            prompt = f"""
-אתה בוט קלוריות בעברית.
-
-המשתמש כתב:
-{msg}
-
-החזר JSON בלבד, בלי טקסט נוסף, בפורמט הזה:
-{{
-  "items": [
-    {{"item": "שם מוצר וכמות", "calories": 100}}
-  ]
-}}
-
-חוקים:
-1. אם המשתמש כתב קלוריות מדויקות, השתמש בהן בדיוק.
-2. אם לא נכתבו קלוריות מדויקות, הערך קלוריות והוסף 3%-5% מרווח ביטחון.
-3. אם ההודעה כוללת כמה מוצרים, פצל לשורות נפרדות.
-4. אם ההודעה לא קשורה לאוכל, החזר items ריק.
-5. calories חייב להיות מספר שלם בלבד.
-"""
-
-            ai = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0
-            )
-
-            raw = ai.choices[0].message.content
-            data = extract_json(raw)
-            items = data.get("items", [])
+            items = openai_parse(msg)
 
             if not items:
-                reply = "לא זיהיתי אוכל בהודעה 😕\nאפשר לכתוב למשל: אכלתי ביצה ופרוסת לחם"
+                reply = "לא זיהיתי אוכל 😕\nכתבי למשל: אכלתי ביצה ופרוסת לחם"
             else:
                 save_items(sender, items)
                 total = daily_total(sender)
@@ -155,9 +150,9 @@ def whatsapp():
     except Exception as e:
         reply = f"שגיאה בחישוב 😕\n{str(e)}"
 
-    twilio_response = MessagingResponse()
-    twilio_response.message(reply)
-    return str(twilio_response)
+    resp = MessagingResponse()
+    resp.message(reply)
+    return str(resp)
 
 if __name__ == "__main__":
     init_db()
